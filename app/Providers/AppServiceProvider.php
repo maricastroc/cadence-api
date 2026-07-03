@@ -23,7 +23,10 @@ class AppServiceProvider extends ServiceProvider
      */
     public function boot(): void
     {
-        if (env('APP_ENV') === 'production') {
+        // Use environment() (reads cached config) rather than env(), which
+        // returns null once config is cached and isn't reloaded per request
+        // under a long-lived Octane worker.
+        if ($this->app->environment('production')) {
             URL::forceScheme('https');
         }
     }

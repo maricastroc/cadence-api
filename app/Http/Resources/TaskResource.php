@@ -20,7 +20,11 @@ class TaskResource extends JsonResource
         return [
             'id' => $this->id,
             'column_id' => $this->column_id,
-            'column_name' => $this->column->name ?? null,
+            // Guard with whenLoaded: on the active-board payload each task is
+            // already nested under its column, so `column` is not eager-loaded
+            // and reading $this->column->name here fired one SELECT per task
+            // (N+1). The key is omitted unless the relation is explicitly loaded.
+            'column_name' => $this->whenLoaded('column', fn () => $this->column->name),
             'uuid' => $this->uuid,
             'name' => $this->name,
             'description' => $this->description,

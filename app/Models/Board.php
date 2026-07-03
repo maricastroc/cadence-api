@@ -152,6 +152,10 @@ class Board extends Model
 
     public function columns(): HasMany
     {
-        return $this->hasMany(Column::class)->orderBy('order')->with('tasks.subtasks');
+        // Eager-loading is left to the call site (getActiveBoard / setActive /
+        // updateWithColumns load the task tree explicitly). Baking `tasks.subtasks`
+        // in here made every columns() touch — pluck('id'), find(), reorder — drag
+        // the whole task+subtask tree along for nothing.
+        return $this->hasMany(Column::class)->orderBy('order');
     }
 }

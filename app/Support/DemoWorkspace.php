@@ -5,7 +5,10 @@ declare(strict_types=1);
 namespace App\Support;
 
 use App\Models\Board;
+use App\Models\Column;
+use App\Models\Subtask;
 use App\Models\Tag;
+use App\Models\Task;
 use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
@@ -54,58 +57,144 @@ final class DemoWorkspace
             Tag::query()->where('user_id', $user->id)->delete();
 
             $blueprint = self::blueprint();
+            $now = now()->toDateTimeString();
+
+            // Rebuild the whole workspace with a handful of bulk inserts instead
+            // of a create() per row. The old row-by-row approach fired hundreds
+            // of round-trips (plus a `SELECT max(order)` per column/task/subtask
+            // from the models' ordering hooks), which blew PHP's 30s limit over
+            // a high-latency DB link. Here every level is one INSERT; we generate
+            // uuids/orders up front and re-read the ids to wire up children.
 
             // The frontend resolves a tag's colour by *name* (see getTagHex), so
             // the stored colour must be a palette name, not a hex value.
-            $tagIds = [];
+            $tagRows = [];
             foreach ($blueprint['tags'] as $name => $colorName) {
-                $tagIds[$name] = Tag::create([
+                $tagRows[] = [
                     'name' => $name,
                     'color' => $colorName,
                     'user_id' => $user->id,
-                ])->id;
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ];
             }
+            if ($tagRows !== []) {
+                Tag::insert($tagRows);
+            }
+            $tagIds = Tag::query()->where('user_id', $user->id)->pluck('id', 'name');
+
+            // Build every child row in memory first, tagging each with a uuid and
+            // its parent's uuid so we can resolve foreign keys after each insert.
+            $columnRows = [];
+            $taskRows = [];
+            $subtaskRows = [];
+            $pivotPlan = []; // taskUuid => [tagName, ...]
 
             foreach ($blueprint['boards'] as $boardData) {
+                // Boards are few, and `is_active` lives on a string column behind
+                // a boolean cast — let Eloquent handle that one; the volume (and
+                // the old N+1) is all in the columns/tasks/subtasks below.
                 $board = Board::create([
                     'name' => $boardData['name'],
                     'user_id' => $user->id,
                     'is_active' => $boardData['active'],
                 ]);
 
+                $columnOrder = 0;
                 foreach ($boardData['columns'] as $columnData) {
-                    // `order` is auto-assigned (max + 1) by the Column model, so
-                    // creating them in array order yields a stable 1..n layout.
-                    $column = $board->columns()->create(['name' => $columnData['name']]);
+                    $columnUuid = (string) Str::uuid();
+                    $columnRows[] = [
+                        'name' => $columnData['name'],
+                        'board_id' => $board->id,
+                        'uuid' => $columnUuid,
+                        'order' => ++$columnOrder,
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
 
+                    $taskOrder = 0;
                     foreach ($columnData['tasks'] ?? [] as $taskData) {
-                        $task = $column->tasks()->create([
+                        $taskUuid = (string) Str::uuid();
+                        $taskRows[] = [
                             'name' => $taskData['name'],
                             'description' => $taskData['description'] ?? null,
+                            'status' => null,
                             'is_completed' => $taskData['completed'] ?? false,
                             'due_date' => isset($taskData['due'])
-                                ? now()->addDays($taskData['due'])
+                                ? now()->addDays($taskData['due'])->toDateTimeString()
                                 : null,
-                        ]);
+                            'order' => ++$taskOrder,
+                            'uuid' => $taskUuid,
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                            '_column_uuid' => $columnUuid,
+                        ];
 
+                        $subtaskOrder = 0;
                         foreach ($taskData['subtasks'] ?? [] as [$subtaskName, $isCompleted]) {
-                            $subtask = $task->subtasks()->create(['name' => $subtaskName]);
-
-                            // The Subtask "creating" hook forces is_completed to
-                            // false, so seeded completions have to be flipped
-                            // after the insert.
-                            if ($isCompleted) {
-                                $subtask->update(['is_completed' => true]);
-                            }
+                            $subtaskRows[] = [
+                                'name' => $subtaskName,
+                                'is_completed' => $isCompleted,
+                                'order' => ++$subtaskOrder,
+                                'uuid' => (string) Str::uuid(),
+                                'created_at' => $now,
+                                'updated_at' => $now,
+                                '_task_uuid' => $taskUuid,
+                            ];
                         }
 
                         if (! empty($taskData['tags'])) {
-                            $task->tags()->sync(
-                                array_map(static fn (string $name): int => $tagIds[$name], $taskData['tags'])
-                            );
+                            $pivotPlan[$taskUuid] = $taskData['tags'];
                         }
                     }
                 }
+            }
+
+            // Columns -> read back their ids by uuid.
+            if ($columnRows !== []) {
+                Column::insert($columnRows);
+            }
+            $columnIdByUuid = Column::query()
+                ->whereIn('uuid', array_column($columnRows, 'uuid'))
+                ->pluck('id', 'uuid');
+
+            // Tasks -> resolve column_id from the map, insert, read back ids.
+            foreach ($taskRows as &$taskRow) {
+                $taskRow['column_id'] = $columnIdByUuid[$taskRow['_column_uuid']];
+                unset($taskRow['_column_uuid']);
+            }
+            unset($taskRow);
+            if ($taskRows !== []) {
+                Task::insert($taskRows);
+            }
+            $taskIdByUuid = Task::query()
+                ->whereIn('uuid', array_column($taskRows, 'uuid'))
+                ->pluck('id', 'uuid');
+
+            // Subtasks -> resolve task_id, insert.
+            foreach ($subtaskRows as &$subtaskRow) {
+                $subtaskRow['task_id'] = $taskIdByUuid[$subtaskRow['_task_uuid']];
+                unset($subtaskRow['_task_uuid']);
+            }
+            unset($subtaskRow);
+            if ($subtaskRows !== []) {
+                Subtask::insert($subtaskRows);
+            }
+
+            // task_tag pivot -> resolve both ids, insert.
+            $pivotRows = [];
+            foreach ($pivotPlan as $taskUuid => $tagNames) {
+                foreach ($tagNames as $tagName) {
+                    $pivotRows[] = [
+                        'task_id' => $taskIdByUuid[$taskUuid],
+                        'tag_id' => $tagIds[$tagName],
+                        'created_at' => $now,
+                        'updated_at' => $now,
+                    ];
+                }
+            }
+            if ($pivotRows !== []) {
+                DB::table('task_tag')->insert($pivotRows);
             }
         });
     }
